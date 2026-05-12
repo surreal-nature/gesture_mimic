@@ -25,17 +25,20 @@ Train and deploy an ACT (Action Chunking with Transformers) policy that watches 
 
 ```
 gesture_mimic/
-├── train.sh              # SLURM-compatible training script
-├── evaluate.py           # Offline evaluation (loss, per-joint error, plots)
-├── deploy_policy.py      # Real-time deployment (webcam + robot or video replay)
-├── pose_estimator.py     # MediaPipe pose estimation + keypoint normalization
-├── preprocess_dataset.py # Convert RGB dataset to keypoint dataset
-├── requirements.txt      # Python dependencies
-├── logs/                 # (created at runtime) SLURM/training logs
-├── data/                 # (created at runtime) Preprocessed keypoint datasets
-└── outputs/              # (created at runtime) Checkpoints and eval results
-    ├── train/act_gesture/      # RGB mode outputs
-    └── train/act_gesture_kp/   # Keypoint mode outputs
+├── train.sh                  # SLURM-compatible training script
+├── evaluate.py               # Offline evaluation (loss, per-joint error, plots)
+├── deploy_policy.py          # Real-time deployment (webcam + robot or video replay)
+├── pose_estimator.py         # MediaPipe pose estimation + keypoint normalization
+├── yolo_preprocessor.py      # YOLO segmentation + arm skeleton overlay
+├── preprocess_dataset.py     # Convert RGB dataset to MediaPipe keypoint dataset
+├── preprocess_dataset_yolo.py # Preprocess RGB dataset with YOLO seg + pose overlay
+├── requirements.txt          # Python dependencies
+├── logs/                     # (created at runtime) SLURM/training logs
+├── data/                     # (created at runtime) Preprocessed datasets
+└── outputs/                  # (created at runtime) Checkpoints and eval results
+    ├── train/act_gesture/         # RGB mode outputs
+    ├── train/act_gesture_kp/      # MediaPipe keypoint mode outputs
+    └── train/act_gesture_yolo/    # YOLO keypoint mode outputs
 ```
 
 No files inside the `lerobot/` repository are modified. Everything is standalone.
@@ -152,16 +155,19 @@ Robot type: `so_follower` (single SO-101 arm, 6-DOF)
 
 ## Quick Start: RGB vs Keypoint Mode
 
-This pipeline supports two input modes, controlled by a single flag:
+This pipeline supports three input modes:
 
 | Mode | Train Command | Deploy Flag | What ACT Sees |
 |------|--------------|-------------|---------------|
 | **RGB** (default) | `bash train.sh` | (none) | Raw camera frames via ResNet-18 |
-| **Keypoint** | `USE_KEYPOINTS=true bash train.sh` | `--use-keypoints` | Normalized pose skeleton (no vision backbone) |
+| **MediaPipe keypoint** | `USE_KEYPOINTS=true bash train.sh` | `--use-keypoints` | Normalized pose skeleton (no vision backbone) |
+| **YOLO keypoint** | `USE_KEYPOINTS=true POSE_BACKEND=yolo bash train.sh` | `--use-keypoints --pose-backend yolo` | Segmented RGB + arm skeleton overlay via ResNet-18 |
 
 **RGB mode** feeds raw webcam frames through a ResNet-18 vision backbone. Good for tasks requiring visual detail (grasping, object interaction).
 
-**Keypoint mode** first preprocesses the dataset to extract MediaPipe pose landmarks, then trains ACT on normalized skeleton + velocity features only (no images). Dramatically better for small datasets and gross arm gestures.
+**MediaPipe keypoint mode** extracts pose landmarks, then trains ACT on normalized skeleton + velocity features only (no images). Best for small datasets and gross arm gestures.
+
+**YOLO keypoint mode** removes the background (YOLOv26n-seg), overlays 6 arm keypoints with an inverted-U skeleton (YOLOv26n-pose), and feeds the modified image through the ResNet-18 vision backbone. Combines the benefits of both: visual input with explicit skeletal structure, reduced background noise.
 
 See [Keypoint Mode Details](#keypoint-mode-details) for the full preprocessing and configuration reference.
 
@@ -193,7 +199,7 @@ DATASET=AmolSapale181284/multigesture-mimic bash train.sh
 sbatch train.sh
 ```
 
-### Keypoint mode
+### MediaPipe keypoint mode
 
 ```bash
 # Step A: Preprocess dataset — extract pose keypoints (run once)
@@ -203,6 +209,18 @@ python preprocess_dataset.py \
 
 # Step B: Train on the keypoint dataset
 USE_KEYPOINTS=true bash train.sh
+```
+
+### YOLO keypoint mode
+
+```bash
+# Step A: Preprocess dataset — segment person + overlay arm skeleton (run once)
+python preprocess_dataset_yolo.py \
+    --source AmolSapale181284/multigesture-mimic \
+    --target local/gesture_mimic_yolo
+
+# Step B: Train on the YOLO-preprocessed dataset
+USE_KEYPOINTS=true POSE_BACKEND=yolo bash train.sh
 ```
 
 ### Common overrides
@@ -224,7 +242,8 @@ PUSH_TO_HUB=true HUB_REPO=myuser/act_gesture_v5 bash train.sh
 | Mode | Checkpoint directory |
 |------|---------------------|
 | RGB | `outputs/train/act_gesture/checkpoints/` |
-| Keypoint | `outputs/train/act_gesture_kp/checkpoints/` |
+| MediaPipe keypoint | `outputs/train/act_gesture_kp/checkpoints/` |
+| YOLO keypoint | `outputs/train/act_gesture_yolo/checkpoints/` |
 
 Checkpoints are saved at every `SAVE_FREQ` steps (default: 5000). A `last/` checkpoint is always saved at the end of training. Each checkpoint contains a `pretrained_model/` directory that can be loaded directly.
 
@@ -242,6 +261,7 @@ Checkpoints are saved at every `SAVE_FREQ` steps (default: 5000). A `last/` chec
 | `KL_WEIGHT` | 10.0 | VAE KL divergence weight |
 | `PRETRAINED` | (none) | Checkpoint path for fine-tuning |
 | `USE_KEYPOINTS` | `false` | Set to `true` to train on preprocessed keypoint dataset |
+| `POSE_BACKEND` | `mediapipe` | Keypoint backend: `mediapipe` (state-only) or `yolo` (segmented RGB) |
 | `PUSH_TO_HUB` | `false` | Push model to HuggingFace Hub after training |
 | `HUB_REPO` | (none) | HuggingFace repo ID (required if `PUSH_TO_HUB=true`) |
 | `WANDB` | `false` | Enable Weights & Biases logging |
@@ -314,7 +334,7 @@ python deploy_policy.py \
     --video gesture_demo.mp4 --no-robot
 ```
 
-### Keypoint mode (add `--use-keypoints`)
+### MediaPipe keypoint mode (add `--use-keypoints`)
 
 ```bash
 # Real-time with webcam (runs MediaPipe online, draws skeleton overlay)
@@ -331,6 +351,20 @@ python deploy_policy.py \
 python deploy_policy.py \
     --checkpoint outputs/train/act_gesture_kp/checkpoints/last/pretrained_model \
     --use-keypoints --video gesture_demo.mp4 --no-robot
+```
+
+### YOLO keypoint mode (add `--use-keypoints --pose-backend yolo`)
+
+```bash
+# Real-time with webcam (runs YOLO seg + pose online, shows segmented + skeleton)
+python deploy_policy.py \
+    --checkpoint outputs/train/act_gesture_yolo/checkpoints/last/pretrained_model \
+    --use-keypoints --pose-backend yolo --no-robot
+
+# Process video file
+python deploy_policy.py \
+    --checkpoint outputs/train/act_gesture_yolo/checkpoints/last/pretrained_model \
+    --use-keypoints --pose-backend yolo --video gesture_demo.mp4 --no-robot
 ```
 
 ### Deploy controls
@@ -354,14 +388,15 @@ The deployment window shows a live overlay with current joint states and predict
 | `--output` | (auto) | Path to save annotated output video |
 | `--fps` | 30 | Target FPS for real-time loop |
 | `--use-keypoints` | false | Enable keypoint mode (online pose estimation) |
-| `--landmarks` | `upper_body` | Landmark preset: `upper_body`, `right_arm`, `left_arm` |
+| `--pose-backend` | `mediapipe` | Pose backend: `mediapipe` (state-only) or `yolo` (segmented RGB) |
+| `--landmarks` | `upper_body` | Landmark preset for MediaPipe: `upper_body`, `right_arm`, `left_arm` |
 | `--device` | `cuda` | Device (`cuda` or `cpu`) |
 
 ---
 
 ## Keypoint Mode Details
 
-Instead of feeding raw RGB frames to ACT (which wastes capacity learning background, lighting, and clothing), keypoint mode extracts human pose landmarks and feeds normalized skeleton data directly.
+Instead of feeding raw RGB frames to ACT (which wastes capacity learning background, lighting, and clothing), keypoint mode extracts human pose information. Two backends are available:
 
 ### Pipeline comparison
 
@@ -369,8 +404,12 @@ Instead of feeding raw RGB frames to ACT (which wastes capacity learning backgro
 RGB mode (default):
   webcam frame -> ResNet-18 -> ACT transformer -> robot action
 
-Keypoint mode (--use-keypoints):
+MediaPipe keypoint mode (--use-keypoints):
   webcam frame -> MediaPipe Pose -> normalized keypoints -> ACT (state-only) -> robot action
+
+YOLO keypoint mode (--use-keypoints --pose-backend yolo):
+  webcam frame -> YOLOv26n-seg (remove background) -> YOLOv26n-pose (overlay 6 arm keypoints)
+    -> modified RGB -> ResNet-18 -> ACT transformer -> robot action
 ```
 
 ### Preprocessing the dataset
@@ -444,19 +483,70 @@ The new `observation.state` dimension = 6 (robot joints) + total keypoint featur
 | `--keep-images` | false | Keep image features alongside keypoints |
 | `--push-to-hub` | false | Push target dataset to HuggingFace Hub |
 
+### YOLO keypoint mode details
+
+Unlike MediaPipe mode (which removes images entirely), YOLO mode keeps images but preprocesses them:
+
+1. **Background removal**: YOLOv26n-seg segments the person and blacks out everything else
+2. **Arm keypoint detection**: YOLOv26n-pose detects 17 COCO keypoints, but only 6 arm keypoints are used:
+
+| COCO Index | Joint | Overlay Color |
+|------------|-------|---------------|
+| 5 | left_shoulder | Green |
+| 6 | right_shoulder | Dark green |
+| 7 | left_elbow | Blue |
+| 8 | right_elbow | Light blue |
+| 9 | left_wrist | Red |
+| 10 | right_wrist | Dark red |
+
+3. **Skeleton overlay**: Keypoints are connected in order 9→7→5→6→8→10 (left wrist → left elbow → left shoulder → right shoulder → right elbow → right wrist), forming an inverted-U shape
+4. **Same observation space**: The modified image has the same shape as the original — the ACT policy, training config, and vision backbone are identical to RGB mode
+
+#### YOLO preprocessing
+
+```bash
+python preprocess_dataset_yolo.py \
+    --source AmolSapale181284/multigesture-mimic \
+    --target local/gesture_mimic_yolo
+
+# On CPU (slower but no GPU needed)
+python preprocess_dataset_yolo.py \
+    --source AmolSapale181284/multigesture-mimic \
+    --target local/gesture_mimic_yolo \
+    --device cpu
+```
+
+#### YOLO preprocessor CLI reference
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--source` | (required) | Source dataset repo_id |
+| `--target` | (required) | Target dataset repo_id |
+| `--target-root` | (auto) | Local path for target dataset |
+| `--source-root` | (auto) | Local path for source dataset |
+| `--seg-model` | `yolo26n-seg.pt` | YOLOv26n segmentation model |
+| `--pose-model` | `yolo26n-pose.pt` | YOLOv26n pose model |
+| `--device` | `cuda` | Device for YOLO inference |
+| `--confidence` | 0.5 | Minimum keypoint confidence to overlay |
+| `--push-to-hub` | false | Push preprocessed dataset to HuggingFace Hub |
+
 ### Why keypoints work better for gesture mimic
 
-| Factor | RGB Mode | Keypoint Mode |
-|--------|----------|---------------|
-| What ACT learns | Perception + control | Control only |
-| Data efficiency | Poor (50 episodes) | Excellent |
-| Training speed | Slow (ResNet-18 backbone) | Fast (state-only) |
-| Camera invariance | None | Built-in (normalization) |
-| Lighting robustness | Poor | Immune |
-| Background sensitivity | High | None |
-| Fine manipulation | Good | Limited |
+| Factor | RGB Mode | MediaPipe Keypoint | YOLO Keypoint |
+|--------|----------|--------------------|---------------|
+| What ACT learns | Perception + control | Control only | Guided perception + control |
+| Data efficiency | Poor (50 episodes) | Excellent | Good |
+| Training speed | Slow (ResNet-18) | Fast (state-only) | Slow (ResNet-18) |
+| Camera invariance | None | Built-in (normalization) | Partial (background removed) |
+| Lighting robustness | Poor | Immune | Good (background removed) |
+| Background sensitivity | High | None | None (segmented) |
+| Fine manipulation | Good | Limited | Good (image preserved) |
+| Explicit skeleton info | None | Full (state features) | Visual (overlay on image) |
 
-**Recommendation**: Use keypoint mode for gross arm gestures (waving, pointing, reaching). Use RGB mode if finger-level detail or object interaction matters.
+**Recommendations**:
+- **MediaPipe keypoint**: Best for small datasets and gross arm gestures (waving, pointing, reaching)
+- **YOLO keypoint**: Best balance — removes background noise while keeping visual detail + explicit skeleton structure
+- **RGB**: Use if the full scene context matters (object interaction, environment-dependent tasks)
 
 ---
 
@@ -482,7 +572,7 @@ Output:
                     then predict a new chunk
 ```
 
-### Keypoint mode
+### MediaPipe keypoint mode
 
 ```
 Input:
@@ -493,6 +583,25 @@ Input:
 
 Architecture:
   Vision backbone:  NONE (no images)
+  Transformer:      dim=512, heads=8, enc_layers=4, dec_layers=1
+  VAE:              latent_dim=32, kl_weight=10.0
+  Feedforward:      3200
+
+Output:
+  Action chunk:     (100, 6) — 100 future joint positions
+```
+
+### YOLO keypoint mode
+
+```
+Input:
+  Modified camera:  (3, 480, 640) -> ResNet-18 -> (512,) features
+    where image = segmented person + 6 colored arm keypoints + skeleton lines
+  Robot state:      (6,) -> Linear(6, 512) -> (512,) features
+
+Architecture:
+  Same as RGB mode — vision backbone processes the YOLO-preprocessed image
+  Vision backbone:  ResNet-18 (pretrained on ImageNet)
   Transformer:      dim=512, heads=8, enc_layers=4, dec_layers=1
   VAE:              latent_dim=32, kl_weight=10.0
   Feedforward:      3200

@@ -18,11 +18,16 @@
 #   export MIOPEN_FIND_ENFORCE=5 MIOPEN_FIND_MODE=2
 #   bash train.sh
 #
-# Keypoint mode (train on preprocessed keypoint dataset):
+# Keypoint mode — MediaPipe (train on preprocessed keypoint dataset):
 #   First preprocess:  python preprocess_dataset.py --source BlankHead/extended_gesture_mimic \
 #                          --target local/gesture_kp
 #   Then train:        USE_KEYPOINTS=true bash train.sh
 #   Or manually:       DATASET=local/gesture_kp DATASET_ROOT=data/local_gesture_kp bash train.sh
+#
+# Keypoint mode — YOLO (segmented RGB + arm skeleton overlay):
+#   First preprocess:  python preprocess_dataset_yolo.py --source AmolSapale181284/multigesture-mimic \
+#                          --target local/gesture_mimic_yolo
+#   Then train:        USE_KEYPOINTS=true POSE_BACKEND=yolo bash train.sh
 
 #SBATCH --job-name=act_gesture
 #SBATCH --partition=defq
@@ -78,8 +83,13 @@ HUB_REPO="${HUB_REPO:-}"
 
 # Keypoint mode
 USE_KEYPOINTS="${USE_KEYPOINTS:-false}"
+POSE_BACKEND="${POSE_BACKEND:-mediapipe}"
 KP_DATASET="${KP_DATASET:-local/gesture_mimic_keypoints}"
 KP_DATASET_ROOT="${KP_DATASET_ROOT:-${SCRIPT_DIR}/data/local_gesture_mimic_keypoints}"
+
+# YOLO keypoint mode
+YOLO_DATASET="${YOLO_DATASET:-local/gesture_mimic_yolo}"
+YOLO_DATASET_ROOT="${YOLO_DATASET_ROOT:-${SCRIPT_DIR}/data/local_gesture_mimic_yolo}"
 
 # --- Environment setup ---
 conda activate act 2>/dev/null || true
@@ -95,15 +105,27 @@ mkdir -p "${SCRIPT_DIR}/logs"
 # --- Build command ---
 # --- Keypoint mode overrides ---
 if [[ "${USE_KEYPOINTS}" == "true" ]]; then
-    DATASET="${KP_DATASET}"
-    DATASET_ROOT="${KP_DATASET_ROOT}"
-    OUTPUT_DIR="${SCRIPT_DIR}/outputs/train/act_gesture_kp"
+    if [[ "${POSE_BACKEND}" == "yolo" ]]; then
+        DATASET="${YOLO_DATASET}"
+        DATASET_ROOT="${YOLO_DATASET_ROOT}"
+        OUTPUT_DIR="${SCRIPT_DIR}/outputs/train/act_gesture_yolo"
+    else
+        DATASET="${KP_DATASET}"
+        DATASET_ROOT="${KP_DATASET_ROOT}"
+        OUTPUT_DIR="${SCRIPT_DIR}/outputs/train/act_gesture_kp"
+    fi
 fi
 
 echo "=== Gesture Mimic ACT Training ==="
 echo "Started: $(date)"
 echo "Node: $(hostname)"
-echo "Mode: $(if [[ "${USE_KEYPOINTS}" == "true" ]]; then echo "KEYPOINT (state-only, no vision backbone)"; else echo "RGB (vision backbone)"; fi)"
+if [[ "${USE_KEYPOINTS}" == "true" && "${POSE_BACKEND}" == "yolo" ]]; then
+    echo "Mode: YOLO (segmented RGB + skeleton overlay, vision backbone)"
+elif [[ "${USE_KEYPOINTS}" == "true" ]]; then
+    echo "Mode: KEYPOINT/MediaPipe (state-only, no vision backbone)"
+else
+    echo "Mode: RGB (vision backbone)"
+fi
 echo "Dataset: ${DATASET}"
 echo "Output: ${OUTPUT_DIR}"
 echo "Steps: ${STEPS}, Batch: ${BATCH_SIZE}"
