@@ -14,6 +14,10 @@
 # Fine-tuning from a previous checkpoint:
 #   PRETRAINED=outputs/train/act_gesture/checkpoints/last/pretrained_model bash train.sh
 #
+# RGB mode with ROCm (AMD GPU):
+#   export MIOPEN_FIND_ENFORCE=5 MIOPEN_FIND_MODE=2
+#   bash train.sh
+#
 # Keypoint mode (train on preprocessed keypoint dataset):
 #   First preprocess:  python preprocess_dataset.py --source BlankHead/extended_gesture_mimic \
 #                          --target local/gesture_kp
@@ -93,7 +97,7 @@ mkdir -p "${SCRIPT_DIR}/logs"
 if [[ "${USE_KEYPOINTS}" == "true" ]]; then
     DATASET="${KP_DATASET}"
     DATASET_ROOT="${KP_DATASET_ROOT}"
-    OUTPUT_DIR="${OUTPUT_DIR:-${SCRIPT_DIR}/outputs/train/act_gesture_kp}"
+    OUTPUT_DIR="${SCRIPT_DIR}/outputs/train/act_gesture_kp"
 fi
 
 echo "=== Gesture Mimic ACT Training ==="
@@ -152,6 +156,9 @@ CMD=(
     --log_freq="${LOG_FREQ}"
     --eval_freq="${EVAL_FREQ}"
     --wandb.enable="${WANDB}"
+
+    # Disable push to hub by default (overridden below if requested)
+    --policy.push_to_hub=false
 )
 
 # Optional: dataset root (for local/cached datasets)
