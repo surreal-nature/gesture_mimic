@@ -1,0 +1,19 @@
+# Policy inference and training
+torch>=2.0
+
+# LeRobot (dataset format, ACT policy, training pipeline)
+# Install from source for latest features:
+#   git clone https://github.com/huggingface/lerobot.git
+#   cd lerobot && pip install -e ".[all]"
+# Or install from PyPI:
+lerobot>=0.5.0
+
+# Deployment (webcam capture and visualization)
+opencv-python>=4.8
+
+# Pose estimation (keypoint mode)
+mediapipe>=0.10
+
+# Evaluation plots
+matplotlib>=3.7
+numpy>=1.24
