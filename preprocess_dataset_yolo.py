@@ -162,7 +162,7 @@ def preprocess_dataset_yolo(
             if frame_offset % 100 == 0 and frame_offset > 0:
                 print(f"    Episode {ep_idx}: {frame_offset}/{ep_length} frames", end="\r")
 
-        target_dataset.save_episode(task=task_str)
+        target_dataset.save_episode()
 
         ep_failures = preprocessor.detection_failure_count - failures_before
         total_failures = preprocessor.detection_failure_count
