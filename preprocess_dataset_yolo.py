@@ -60,8 +60,8 @@ def image_tensor_to_rgb(tensor):
 
 
 def rgb_to_image_tensor(rgb):
-    """Convert uint8 RGB numpy array to (3, H, W) float32 tensor."""
-    return torch.from_numpy(rgb).permute(2, 0, 1).float() / 255.0
+    """Convert uint8 RGB numpy array to HWC uint8 tensor (LeRobot v3 format)."""
+    return torch.from_numpy(rgb.copy())
 
 
 def preprocess_dataset_yolo(
@@ -76,8 +76,6 @@ def preprocess_dataset_yolo(
     push_to_hub=False,
 ):
     from lerobot.datasets.lerobot_dataset import LeRobotDataset, LeRobotDatasetMetadata
-    from lerobot.policies.act.configuration_act import ACTConfig
-    from lerobot.datasets.factory import resolve_delta_timestamps
 
     print(f"Loading source dataset: {source_repo_id}")
     source_meta = LeRobotDatasetMetadata(source_repo_id, root=source_root)
@@ -106,13 +104,8 @@ def preprocess_dataset_yolo(
     for key, feat in source_meta.features.items():
         features[key] = dict(feat)
 
-    config = ACTConfig(chunk_size=100)
-    delta_timestamps = resolve_delta_timestamps(config, source_meta)
-
     source_kwargs = {
         "repo_id": source_repo_id,
-        "delta_timestamps": delta_timestamps,
-        "tolerance_s": 0.0001,
     }
     if source_root:
         source_kwargs["root"] = source_root
@@ -138,11 +131,17 @@ def preprocess_dataset_yolo(
     total_frames = 0
     total_failures = 0
 
+    episodes_info = source_meta.episodes
     for ep_idx in range(source_meta.total_episodes):
-        ep_start = source_dataset.episode_data_index["from"][ep_idx].item()
-        ep_end = source_dataset.episode_data_index["to"][ep_idx].item()
+        ep_start = episodes_info[ep_idx]["dataset_from_index"]
+        ep_end = episodes_info[ep_idx]["dataset_to_index"]
         ep_length = ep_end - ep_start
         failures_before = preprocessor.detection_failure_count
+
+        task_str = "Gesture mimic"
+        ep_tasks = episodes_info[ep_idx].get("tasks")
+        if ep_tasks and isinstance(ep_tasks, list) and len(ep_tasks) > 0:
+            task_str = ep_tasks[0]
 
         for frame_offset, global_idx in enumerate(range(ep_start, ep_end)):
             sample = source_dataset[global_idx]
@@ -153,6 +152,7 @@ def preprocess_dataset_yolo(
             modified_tensor = rgb_to_image_tensor(modified_rgb)
 
             frame = {
+                "task": task_str,
                 "observation.state": sample["observation.state"],
                 "action": sample["action"],
                 camera_key: modified_tensor,
@@ -161,13 +161,6 @@ def preprocess_dataset_yolo(
 
             if frame_offset % 100 == 0 and frame_offset > 0:
                 print(f"    Episode {ep_idx}: {frame_offset}/{ep_length} frames", end="\r")
-
-        task_str = "Gesture mimic"
-        if hasattr(source_meta, "tasks") and source_meta.tasks:
-            if isinstance(source_meta.tasks, dict):
-                task_str = list(source_meta.tasks.values())[0]
-            elif isinstance(source_meta.tasks, list) and len(source_meta.tasks) > 0:
-                task_str = source_meta.tasks[0]
 
         target_dataset.save_episode(task=task_str)
 
