@@ -1,6 +1,9 @@
-# Gesture Mimic — ACT Policy Training & Deployment
+# Gesture Mimic — ACT & Diffusion Policy Training & Deployment
 
-Train and deploy an ACT (Action Chunking with Transformers) policy that watches a human via camera and drives an SO-101 robot arm to mimic their gestures in real-time.
+Train and deploy gesture mimic policies that watch a human via camera and drive an SO-101 robot arm to mimic their gestures in real-time. Supports two policy architectures:
+
+- **ACT** (Action Chunking with Transformers) — predicts action chunks directly via a transformer + VAE
+- **Diffusion Policy** — generates smooth future trajectories via iterative denoising, producing more natural robot motions
 
 ---
 
@@ -11,11 +14,10 @@ Train and deploy an ACT (Action Chunking with Transformers) policy that watches 
 - [Installation](#installation)
 - [Datasets](#datasets)
 - [Quick Start: RGB vs Keypoint Mode](#quick-start-rgb-vs-keypoint-mode)
-- [Step 1: Train](#step-1-train)
-- [Step 2: Evaluate](#step-2-evaluate)
-- [Step 3: Deploy](#step-3-deploy)
+- [ACT Policy](#act-policy)
+- [Diffusion Policy](#diffusion-policy)
 - [Keypoint Mode Details](#keypoint-mode-details)
-- [ACT Policy Architecture](#act-policy-architecture)
+- [Policy Architecture Comparison](#policy-architecture-comparison)
 - [Training Tips](#training-tips)
 - [Troubleshooting](#troubleshooting)
 
@@ -25,20 +27,27 @@ Train and deploy an ACT (Action Chunking with Transformers) policy that watches 
 
 ```
 gesture_mimic/
-├── train.sh                  # SLURM-compatible training script
-├── evaluate.py               # Offline evaluation (loss, per-joint error, plots)
-├── deploy_policy.py          # Real-time deployment (webcam + robot or video replay)
-├── pose_estimator.py         # MediaPipe pose estimation + keypoint normalization
-├── yolo_preprocessor.py      # YOLO segmentation + arm skeleton overlay
-├── preprocess_dataset.py     # Convert RGB dataset to MediaPipe keypoint dataset
+├── train.sh                   # ACT policy training script
+├── train_diffusion.sh         # Diffusion Policy training script
+├── evaluate.py                # ACT offline evaluation
+├── evaluate_diffusion.py      # Diffusion Policy offline evaluation
+├── deploy_policy.py           # ACT real-time deployment
+├── deploy_diffusion.py        # Diffusion Policy real-time deployment
+├── pose_estimator.py          # MediaPipe pose estimation + keypoint normalization
+├── yolo_preprocessor.py       # YOLO segmentation + arm skeleton overlay
+├── merge_datasets.py          # Merge multiple datasets into one for training
+├── preprocess_dataset.py      # Convert RGB dataset to MediaPipe keypoint dataset
 ├── preprocess_dataset_yolo.py # Preprocess RGB dataset with YOLO seg + pose overlay
-├── requirements.txt          # Python dependencies
-├── logs/                     # (created at runtime) SLURM/training logs
-├── data/                     # (created at runtime) Preprocessed datasets
-└── outputs/                  # (created at runtime) Checkpoints and eval results
-    ├── train/act_gesture/         # RGB mode outputs
-    ├── train/act_gesture_kp/      # MediaPipe keypoint mode outputs
-    └── train/act_gesture_yolo/    # YOLO keypoint mode outputs
+├── requirements.txt           # Python dependencies
+├── logs/                      # (created at runtime) SLURM/training logs
+├── data/                      # (created at runtime) Preprocessed datasets
+└── outputs/                   # (created at runtime) Checkpoints and eval results
+    ├── train/act_gesture/              # ACT RGB mode
+    ├── train/act_gesture_kp/           # ACT MediaPipe keypoint mode
+    ├── train/act_gesture_yolo/         # ACT YOLO keypoint mode
+    ├── train/diffusion_gesture/        # Diffusion RGB mode
+    ├── train/diffusion_gesture_kp/     # Diffusion MediaPipe keypoint mode
+    └── train/diffusion_gesture_yolo/   # Diffusion YOLO keypoint mode
 ```
 
 No files inside the `lerobot/` repository are modified. Everything is standalone.
@@ -132,12 +141,14 @@ The `train.sh` script sets these automatically when `rocminfo` is detected, but 
 
 ## Datasets
 
-Two LeRobot v3.0 datasets are available on HuggingFace Hub (auto-downloaded on first use):
+Multiple LeRobot v3.0 datasets are available on HuggingFace Hub (auto-downloaded on first use):
 
 | Dataset | Episodes | Frames | Description |
 |---------|----------|--------|-------------|
 | [AmolSapale181284/multigesture-mimic](https://huggingface.co/datasets/AmolSapale181284/multigesture-mimic) | 50 | 19,329 | Original multi-gesture dataset |
 | [BlankHead/extended_gesture_mimic](https://huggingface.co/datasets/BlankHead/extended_gesture_mimic) | — | — | Extended dataset with more demonstrations |
+| [AMD-PAVS-AI/multigesture_mimic_test](https://huggingface.co/datasets/AMD-PAVS-AI/multigesture_mimic_test) | 10 | 3,868 | Test subset (shorter evaluation runs) |
+| [AMD-PAVS-AI/Action-per-video-multigesture-mimic](https://huggingface.co/datasets/AMD-PAVS-AI/Action-per-video-multigesture-mimic) | 450 | 107,760 | Large dataset with one action per video (~8s episodes) |
 
 ### Dataset features
 
@@ -150,6 +161,55 @@ Two LeRobot v3.0 datasets are available on HuggingFace Hub (auto-downloaded on f
 Joint order: `shoulder_pan`, `shoulder_lift`, `elbow_flex`, `wrist_flex`, `wrist_roll`, `gripper`
 
 Robot type: `so_follower` (single SO-101 arm, 6-DOF)
+
+### Merging datasets
+
+Since `lerobot-train` accepts only a single dataset, use `merge_datasets.py` to combine multiple datasets before training:
+
+```bash
+# Merge the original + AMD-PAVS-AI datasets into one (~510 episodes, ~130K frames)
+python merge_datasets.py \
+    --sources AmolSapale181284/multigesture-mimic \
+              AMD-PAVS-AI/multigesture_mimic_test \
+              AMD-PAVS-AI/Action-per-video-multigesture-mimic \
+    --target local/gesture_mimic_merged
+
+# Train on the merged dataset
+DATASET=local/gesture_mimic_merged \
+    DATASET_ROOT=data/local_gesture_mimic_merged \
+    bash train.sh
+
+# Merge all known datasets (including extended)
+python merge_datasets.py \
+    --sources AmolSapale181284/multigesture-mimic \
+              BlankHead/extended_gesture_mimic \
+              AMD-PAVS-AI/multigesture_mimic_test \
+              AMD-PAVS-AI/Action-per-video-multigesture-mimic \
+    --target local/gesture_mimic_all
+
+# Push merged dataset to HuggingFace Hub
+python merge_datasets.py \
+    --sources AmolSapale181284/multigesture-mimic \
+              AMD-PAVS-AI/Action-per-video-multigesture-mimic \
+    --target myuser/gesture_mimic_combined \
+    --push-to-hub
+```
+
+The merged dataset can also be preprocessed for keypoint modes:
+
+```bash
+# MediaPipe keypoint preprocessing on merged dataset
+python preprocess_dataset.py \
+    --source local/gesture_mimic_merged \
+    --source-root data/local_gesture_mimic_merged \
+    --target local/merged_keypoints
+
+# YOLO keypoint preprocessing on merged dataset
+python preprocess_dataset_yolo.py \
+    --source local/gesture_mimic_merged \
+    --source-root data/local_gesture_mimic_merged \
+    --target local/merged_yolo
+```
 
 ---
 
@@ -190,6 +250,13 @@ DATASET=AmolSapale181284/multigesture-mimic bash train.sh
 
 # Train on the extended dataset (used if DATASET is not set)
 bash train.sh
+
+# Train on AMD-PAVS-AI datasets
+DATASET=AMD-PAVS-AI/Action-per-video-multigesture-mimic bash train.sh
+DATASET=AMD-PAVS-AI/multigesture_mimic_test bash train.sh
+
+# Train on a merged dataset (see "Merging datasets" section above)
+DATASET=local/gesture_mimic_merged DATASET_ROOT=data/local_gesture_mimic_merged bash train.sh
 
 # AMD ROCm GPU — set MIOpen flags for stable kernel tuning
 export MIOPEN_FIND_ENFORCE=5 MIOPEN_FIND_MODE=2
@@ -251,7 +318,7 @@ Checkpoints are saved at every `SAVE_FREQ` steps (default: 5000). A `last/` chec
 
 | Parameter | Default | Description |
 |-----------|---------|-------------|
-| `DATASET` | `BlankHead/extended_gesture_mimic` | HuggingFace dataset repo_id |
+| `DATASET` | `BlankHead/extended_gesture_mimic` | HuggingFace dataset repo_id (or local merged dataset) |
 | `DATASET_ROOT` | (auto) | Local path for cached/local datasets |
 | `STEPS` | 20000 | Total training steps |
 | `BATCH_SIZE` | 8 | Per-GPU batch size |
@@ -391,6 +458,126 @@ The deployment window shows a live overlay with current joint states and predict
 | `--pose-backend` | `mediapipe` | Pose backend: `mediapipe` (state-only) or `yolo` (segmented RGB) |
 | `--landmarks` | `upper_body` | Landmark preset for MediaPipe: `upper_body`, `right_arm`, `left_arm` |
 | `--device` | `cuda` | Device (`cuda` or `cpu`) |
+
+---
+
+## Diffusion Policy
+
+Diffusion Policy generates smooth future trajectories via iterative denoising instead of predicting action chunks directly. This produces more natural, anticipatory robot motions — especially important for continuous gesture tracking where ACT can produce jerky transitions at chunk boundaries.
+
+**The same datasets used for ACT work for Diffusion Policy — no data recollection needed.**
+
+### How it works
+
+```
+Training:
+  Clean action trajectory → Add noise (100 steps) → Train UNet to predict noise
+
+Inference:
+  Random noise → Denoise (10 steps) → Smooth robot trajectory
+```
+
+The policy conditions on `n_obs_steps` recent observations (default: 2) to predict a `horizon`-length trajectory (default: 32 steps = ~1s at 30fps), of which `n_action_steps` (default: 16 steps = ~0.5s) are executed before re-planning.
+
+### Installation
+
+Diffusion Policy requires the `diffusers` package:
+
+```bash
+conda activate act
+pip install diffusers
+```
+
+### Train
+
+```bash
+cd gesture_mimic
+conda activate act
+
+# RGB mode (default)
+bash train_diffusion.sh
+
+# With specific dataset
+DATASET=AmolSapale181284/multigesture-mimic bash train_diffusion.sh
+
+# MediaPipe keypoint mode (preprocess first)
+python preprocess_dataset.py --source BlankHead/extended_gesture_mimic --target local/gesture_kp
+USE_KEYPOINTS=true bash train_diffusion.sh
+
+# YOLO keypoint mode (preprocess first)
+python preprocess_dataset_yolo.py --source AmolSapale181284/multigesture-mimic --target local/gesture_mimic_yolo
+USE_KEYPOINTS=true POSE_BACKEND=yolo bash train_diffusion.sh
+
+# Override hyperparameters
+STEPS=30000 BATCH_SIZE=16 HORIZON=64 N_ACTION_STEPS=32 bash train_diffusion.sh
+
+# Fine-tune from a previous checkpoint
+PRETRAINED=outputs/train/diffusion_gesture/checkpoints/last/pretrained_model bash train_diffusion.sh
+```
+
+### Diffusion training configuration reference
+
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `N_OBS_STEPS` | 2 | Number of past observations for temporal context |
+| `HORIZON` | 32 | Trajectory prediction length (~1s at 30fps) |
+| `N_ACTION_STEPS` | 16 | Actions to execute before re-planning (~0.5s) |
+| `DOWN_DIMS` | `[256,512,1024]` | UNet feature dimensions (3 stages) |
+| `NOISE_SCHEDULER_TYPE` | `DDPM` | Noise scheduler for training |
+| `NUM_TRAIN_TIMESTEPS` | 100 | Forward diffusion steps |
+| `NUM_INFERENCE_STEPS` | 10 | Reverse denoising steps (DDIM, faster) |
+| `PREDICTION_TYPE` | `epsilon` | Predict noise (`epsilon`) or sample (`sample`) |
+| `LR` | 1e-4 | Learning rate |
+| `STEPS` | 20000 | Total training steps |
+| `BATCH_SIZE` | 8 | Per-GPU batch size |
+
+All ACT environment variables (`DATASET`, `DATASET_ROOT`, `USE_KEYPOINTS`, `POSE_BACKEND`, `WANDB`, etc.) also apply.
+
+### Evaluate
+
+```bash
+# Evaluate all checkpoints
+python evaluate_diffusion.py --training-dir outputs/train/diffusion_gesture
+
+# Single checkpoint
+python evaluate_diffusion.py --checkpoint outputs/train/diffusion_gesture/checkpoints/last/pretrained_model
+
+# Keypoint mode
+python evaluate_diffusion.py --training-dir outputs/train/diffusion_gesture_kp \
+    --dataset local/gesture_mimic_keypoints \
+    --dataset-root data/local_gesture_mimic_keypoints
+```
+
+### Deploy
+
+```bash
+# RGB mode with robot
+python deploy_diffusion.py \
+    --checkpoint outputs/train/diffusion_gesture/checkpoints/last/pretrained_model \
+    --port /dev/ttyUSB0
+
+# No-robot mode (visualization only)
+python deploy_diffusion.py \
+    --checkpoint outputs/train/diffusion_gesture/checkpoints/last/pretrained_model \
+    --no-robot
+
+# MediaPipe keypoint mode
+python deploy_diffusion.py \
+    --checkpoint outputs/train/diffusion_gesture_kp/checkpoints/last/pretrained_model \
+    --use-keypoints --no-robot
+
+# YOLO keypoint mode
+python deploy_diffusion.py \
+    --checkpoint outputs/train/diffusion_gesture_yolo/checkpoints/last/pretrained_model \
+    --use-keypoints --pose-backend yolo --no-robot
+
+# Process video file
+python deploy_diffusion.py \
+    --checkpoint outputs/train/diffusion_gesture/checkpoints/last/pretrained_model \
+    --video gesture_demo.mp4 --no-robot
+```
+
+The deploy overlay shows denoising inference time in addition to FPS and joint angles.
 
 ---
 
@@ -550,65 +737,57 @@ python preprocess_dataset_yolo.py \
 
 ---
 
-## ACT Policy Architecture
+## Policy Architecture Comparison
 
-### RGB mode
-
-```
-Input:
-  Human camera:  (3, 480, 640) -> ResNet-18 -> (512,) features
-  Robot state:   (6,) -> Linear(6, 512) -> (512,) features
-  Combined:      Image + state tokens -> Transformer encoder
-
-Architecture:
-  Vision backbone:  ResNet-18 (pretrained on ImageNet)
-  Transformer:      dim=512, heads=8, enc_layers=4, dec_layers=1
-  VAE:              latent_dim=32, kl_weight=10.0
-  Feedforward:      3200
-
-Output:
-  Action chunk:     (100, 6) — 100 future joint positions
-  At inference:     execute all 100 actions sequentially (~3.3s),
-                    then predict a new chunk
-```
-
-### MediaPipe keypoint mode
+### ACT (Action Chunking with Transformers)
 
 ```
-Input:
-  Extended state:  (6 + K,) -> Linear(6+K, 512) -> (512,) features
-    where:
-      robot state:  (6,) joint angles
-      keypoints:    (K,) normalized positions + velocities + accelerations
-
-Architecture:
-  Vision backbone:  NONE (no images)
-  Transformer:      dim=512, heads=8, enc_layers=4, dec_layers=1
-  VAE:              latent_dim=32, kl_weight=10.0
-  Feedforward:      3200
-
-Output:
-  Action chunk:     (100, 6) — 100 future joint positions
+Observation (single frame)
+    ↓
+ResNet-18 (images) + Linear (state)
+    ↓
+Transformer Encoder-Decoder + VAE
+    ↓
+Action Chunk: (100, 6) — 100 future joint positions
+    ↓
+Execute all 100 sequentially (~3.3s), then predict new chunk
 ```
 
-### YOLO keypoint mode
+- **Pros**: Simple, fast inference (single forward pass)
+- **Cons**: Jerky at chunk boundaries, no temporal observation context, reacts late to direction changes
+
+### Diffusion Policy
 
 ```
-Input:
-  Modified camera:  (3, 480, 640) -> ResNet-18 -> (512,) features
-    where image = segmented person + 6 colored arm keypoints + skeleton lines
-  Robot state:      (6,) -> Linear(6, 512) -> (512,) features
-
-Architecture:
-  Same as RGB mode — vision backbone processes the YOLO-preprocessed image
-  Vision backbone:  ResNet-18 (pretrained on ImageNet)
-  Transformer:      dim=512, heads=8, enc_layers=4, dec_layers=1
-  VAE:              latent_dim=32, kl_weight=10.0
-  Feedforward:      3200
-
-Output:
-  Action chunk:     (100, 6) — 100 future joint positions
+Observations (2 recent frames)
+    ↓
+ResNet-18 + SpatialSoftmax (images) + Linear (state)
+    ↓
+Conditioning Vector
+    ↓
+1D Conditional UNet (iterative denoising: noise → trajectory)
+    ↓
+Trajectory: (32, 6) — 32-step smooth trajectory (~1s)
+    ↓
+Execute 16 steps (~0.5s), then re-plan with overlap
 ```
+
+- **Pros**: Smooth trajectories, temporal context from observation history, better multimodal behavior, natural motion anticipation
+- **Cons**: Slower per-chunk inference (10 denoising steps), requires `diffusers` package
+
+### Why Diffusion Policy works better for gesture mimic
+
+| Factor | ACT | Diffusion Policy |
+|--------|-----|-----------------|
+| Trajectory smoothness | Chunk boundaries can be jerky | Naturally smooth (denoising) |
+| Temporal context | Single observation | `n_obs_steps` recent observations |
+| Motion anticipation | None (reactive) | Learns temporal correlations |
+| Re-planning frequency | Every ~3.3s (100 steps) | Every ~0.5s (16 steps) |
+| Direction change response | Delayed | Faster (shorter action horizon + overlap) |
+| Inference speed | ~5ms (single pass) | ~50ms (10 denoising steps) |
+| Training compute | Lower | Higher |
+
+For gesture mimic, the Diffusion Policy's ability to generate smooth future trajectories conditioned on recent motion history makes it fundamentally better suited than ACT, which must constantly predict fresh action chunks and stitch them together.
 
 ---
 

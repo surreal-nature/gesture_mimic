@@ -1,50 +1,42 @@
 #!/bin/bash
-# Training script for gesture mimic ACT policy.
+# Training script for gesture mimic Diffusion Policy.
 #
-# Trains an ACT policy to mimic human gestures observed via camera.
-# The robot (SO-101 follower, 6-DOF) learns to reproduce arm/hand
-# movements demonstrated by a human in the camera frame.
+# Trains a Diffusion Policy to mimic human gestures observed via camera.
+# Uses a 1D conditional UNet with DDPM/DDIM noise scheduling to generate
+# smooth future action trajectories via iterative denoising.
+#
+# The same datasets used for ACT training work here — no data recollection needed.
 #
 # Usage:
-#   bash train.sh                                    # defaults (extended dataset)
-#   bash train.sh --steps 50000                      # override steps
-#   DATASET=AmolSapale181284/multigesture-mimic bash train.sh  # use original dataset
-#   DATASET=AMD-PAVS-AI/multigesture_mimic_test bash train.sh # AMD test dataset (10 episodes)
-#   DATASET=AMD-PAVS-AI/Action-per-video-multigesture-mimic bash train.sh # AMD large dataset (450 episodes)
-#   SLURM: sbatch train.sh
+#   bash train_diffusion.sh                              # defaults (extended dataset, RGB mode)
+#   bash train_diffusion.sh --steps 50000                # override steps
+#   DATASET=AmolSapale181284/multigesture-mimic bash train_diffusion.sh
+#   DATASET=AMD-PAVS-AI/Action-per-video-multigesture-mimic bash train_diffusion.sh
 #
-# Merged dataset (combine multiple datasets, then train):
-#   python merge_datasets.py \
-#       --sources AmolSapale181284/multigesture-mimic \
-#                 AMD-PAVS-AI/multigesture_mimic_test \
-#                 AMD-PAVS-AI/Action-per-video-multigesture-mimic \
-#       --target local/gesture_mimic_merged
-#   DATASET=local/gesture_mimic_merged DATASET_ROOT=data/local_gesture_mimic_merged bash train.sh
+# Merged dataset:
+#   DATASET=local/gesture_mimic_merged DATASET_ROOT=data/local_gesture_mimic_merged bash train_diffusion.sh
 #
 # Fine-tuning from a previous checkpoint:
-#   PRETRAINED=outputs/train/act_gesture/checkpoints/last/pretrained_model bash train.sh
+#   PRETRAINED=outputs/train/diffusion_gesture/checkpoints/last/pretrained_model bash train_diffusion.sh
 #
-# RGB mode with ROCm (AMD GPU):
-#   export MIOPEN_FIND_ENFORCE=5 MIOPEN_FIND_MODE=2
-#   bash train.sh
-#
-# Keypoint mode — MediaPipe (train on preprocessed keypoint dataset):
+# MediaPipe keypoint mode (train on preprocessed keypoint dataset):
 #   First preprocess:  python preprocess_dataset.py --source BlankHead/extended_gesture_mimic \
 #                          --target local/gesture_kp
-#   Then train:        USE_KEYPOINTS=true bash train.sh
-#   Or manually:       DATASET=local/gesture_kp DATASET_ROOT=data/local_gesture_kp bash train.sh
+#   Then train:        USE_KEYPOINTS=true bash train_diffusion.sh
 #
-# Keypoint mode — YOLO (segmented RGB + arm skeleton overlay):
+# YOLO keypoint mode (segmented RGB + arm skeleton overlay):
 #   First preprocess:  python preprocess_dataset_yolo.py --source AmolSapale181284/multigesture-mimic \
 #                          --target local/gesture_mimic_yolo
-#   Then train:        USE_KEYPOINTS=true POSE_BACKEND=yolo bash train.sh
+#   Then train:        USE_KEYPOINTS=true POSE_BACKEND=yolo bash train_diffusion.sh
+#
+# SLURM: sbatch train_diffusion.sh
 
-#SBATCH --job-name=act_gesture
+#SBATCH --job-name=diff_gesture
 #SBATCH --partition=defq
 #SBATCH --gres=gpu:gfx942-mi300x:1
-#SBATCH --time=04:00:00
-#SBATCH --output=logs/train_%j.log
-#SBATCH --error=logs/train_%j.log
+#SBATCH --time=06:00:00
+#SBATCH --output=logs/train_diffusion_%j.log
+#SBATCH --error=logs/train_diffusion_%j.log
 
 set -euo pipefail
 
@@ -53,33 +45,42 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 # --- Configuration (override via environment variables) ---
 DATASET="${DATASET:-BlankHead/extended_gesture_mimic}"
 DATASET_ROOT="${DATASET_ROOT:-}"
-OUTPUT_DIR="${OUTPUT_DIR:-${SCRIPT_DIR}/outputs/train/act_gesture}"
+OUTPUT_DIR="${OUTPUT_DIR:-${SCRIPT_DIR}/outputs/train/diffusion_gesture}"
 PRETRAINED="${PRETRAINED:-}"
 STEPS="${STEPS:-20000}"
 BATCH_SIZE="${BATCH_SIZE:-8}"
 NUM_WORKERS="${NUM_WORKERS:-4}"
 SEED="${SEED:-1000}"
 
-# ACT architecture
-CHUNK_SIZE="${CHUNK_SIZE:-100}"
-N_ACTION_STEPS="${N_ACTION_STEPS:-100}"
+# Diffusion architecture
+N_OBS_STEPS="${N_OBS_STEPS:-2}"
+HORIZON="${HORIZON:-32}"
+N_ACTION_STEPS="${N_ACTION_STEPS:-16}"
 VISION_BACKBONE="${VISION_BACKBONE:-resnet18}"
-DIM_MODEL="${DIM_MODEL:-512}"
-N_HEADS="${N_HEADS:-8}"
-DIM_FEEDFORWARD="${DIM_FEEDFORWARD:-3200}"
-N_ENCODER_LAYERS="${N_ENCODER_LAYERS:-4}"
-N_DECODER_LAYERS="${N_DECODER_LAYERS:-1}"
-LATENT_DIM="${LATENT_DIM:-32}"
-N_VAE_ENCODER_LAYERS="${N_VAE_ENCODER_LAYERS:-4}"
-DROPOUT="${DROPOUT:-0.1}"
-KL_WEIGHT="${KL_WEIGHT:-10.0}"
+DOWN_DIMS="${DOWN_DIMS:-[256,512,1024]}"
+KERNEL_SIZE="${KERNEL_SIZE:-5}"
+N_GROUPS="${N_GROUPS:-8}"
+DIFFUSION_STEP_EMBED_DIM="${DIFFUSION_STEP_EMBED_DIM:-128}"
+USE_FILM_SCALE_MODULATION="${USE_FILM_SCALE_MODULATION:-true}"
+SPATIAL_SOFTMAX_NUM_KEYPOINTS="${SPATIAL_SOFTMAX_NUM_KEYPOINTS:-32}"
+USE_GROUP_NORM="${USE_GROUP_NORM:-true}"
+
+# Noise scheduler
+NOISE_SCHEDULER_TYPE="${NOISE_SCHEDULER_TYPE:-DDPM}"
+NUM_TRAIN_TIMESTEPS="${NUM_TRAIN_TIMESTEPS:-100}"
+NUM_INFERENCE_STEPS="${NUM_INFERENCE_STEPS:-10}"
+BETA_SCHEDULE="${BETA_SCHEDULE:-squaredcos_cap_v2}"
+BETA_START="${BETA_START:-0.0001}"
+BETA_END="${BETA_END:-0.02}"
+PREDICTION_TYPE="${PREDICTION_TYPE:-epsilon}"
+CLIP_SAMPLE="${CLIP_SAMPLE:-true}"
+CLIP_SAMPLE_RANGE="${CLIP_SAMPLE_RANGE:-1.0}"
 
 # Optimizer
-LR="${LR:-1e-5}"
-WEIGHT_DECAY="${WEIGHT_DECAY:-1e-4}"
+LR="${LR:-1e-4}"
+WEIGHT_DECAY="${WEIGHT_DECAY:-1e-6}"
 GRAD_CLIP_NORM="${GRAD_CLIP_NORM:-10.0}"
-WARMUP_STEPS="${WARMUP_STEPS:-200}"
-DECAY_LR="${DECAY_LR:-1e-7}"
+WARMUP_STEPS="${WARMUP_STEPS:-500}"
 
 # Logging / saving
 SAVE_FREQ="${SAVE_FREQ:-5000}"
@@ -112,21 +113,20 @@ fi
 
 mkdir -p "${SCRIPT_DIR}/logs"
 
-# --- Build command ---
 # --- Keypoint mode overrides ---
 if [[ "${USE_KEYPOINTS}" == "true" ]]; then
     if [[ "${POSE_BACKEND}" == "yolo" ]]; then
         DATASET="${YOLO_DATASET}"
         DATASET_ROOT="${YOLO_DATASET_ROOT}"
-        OUTPUT_DIR="${SCRIPT_DIR}/outputs/train/act_gesture_yolo"
+        OUTPUT_DIR="${SCRIPT_DIR}/outputs/train/diffusion_gesture_yolo"
     else
         DATASET="${KP_DATASET}"
         DATASET_ROOT="${KP_DATASET_ROOT}"
-        OUTPUT_DIR="${SCRIPT_DIR}/outputs/train/act_gesture_kp"
+        OUTPUT_DIR="${SCRIPT_DIR}/outputs/train/diffusion_gesture_kp"
     fi
 fi
 
-echo "=== Gesture Mimic ACT Training ==="
+echo "=== Gesture Mimic Diffusion Policy Training ==="
 echo "Started: $(date)"
 echo "Node: $(hostname)"
 if [[ "${USE_KEYPOINTS}" == "true" && "${POSE_BACKEND}" == "yolo" ]]; then
@@ -139,49 +139,54 @@ fi
 echo "Dataset: ${DATASET}"
 echo "Output: ${OUTPUT_DIR}"
 echo "Steps: ${STEPS}, Batch: ${BATCH_SIZE}"
+echo "Horizon: ${HORIZON}, N_action_steps: ${N_ACTION_STEPS}, N_obs_steps: ${N_OBS_STEPS}"
 python -c "import torch; print(f'PyTorch: {torch.__version__}'); print(f'CUDA/ROCm: {torch.version.hip if hasattr(torch.version, \"hip\") else torch.version.cuda}'); print(f'GPUs: {torch.cuda.device_count()}'); print(f'Device: {torch.cuda.get_device_name(0) if torch.cuda.is_available() else \"cpu\"}')" 2>/dev/null || true
 
 CMD=(
     lerobot-train
-    --policy.type=act
+    --policy.type=diffusion
     --dataset.repo_id="${DATASET}"
     --dataset.image_transforms.enable=true
 
-    # ACT architecture
-    --policy.chunk_size="${CHUNK_SIZE}"
+    # Diffusion architecture
+    --policy.n_obs_steps="${N_OBS_STEPS}"
+    --policy.horizon="${HORIZON}"
     --policy.n_action_steps="${N_ACTION_STEPS}"
     --policy.vision_backbone="${VISION_BACKBONE}"
-    --policy.dim_model="${DIM_MODEL}"
-    --policy.n_heads="${N_HEADS}"
-    --policy.dim_feedforward="${DIM_FEEDFORWARD}"
-    --policy.n_encoder_layers="${N_ENCODER_LAYERS}"
-    --policy.n_decoder_layers="${N_DECODER_LAYERS}"
-    --policy.use_vae=true
-    --policy.latent_dim="${LATENT_DIM}"
-    --policy.n_vae_encoder_layers="${N_VAE_ENCODER_LAYERS}"
-    --policy.dropout="${DROPOUT}"
-    --policy.kl_weight="${KL_WEIGHT}"
+    --policy.down_dims="${DOWN_DIMS}"
+    --policy.kernel_size="${KERNEL_SIZE}"
+    --policy.n_groups="${N_GROUPS}"
+    --policy.diffusion_step_embed_dim="${DIFFUSION_STEP_EMBED_DIM}"
+    --policy.use_film_scale_modulation="${USE_FILM_SCALE_MODULATION}"
+    --policy.spatial_softmax_num_keypoints="${SPATIAL_SOFTMAX_NUM_KEYPOINTS}"
+    --policy.use_group_norm="${USE_GROUP_NORM}"
+
+    # Noise scheduler
+    --policy.noise_scheduler_type="${NOISE_SCHEDULER_TYPE}"
+    --policy.num_train_timesteps="${NUM_TRAIN_TIMESTEPS}"
+    --policy.beta_schedule="${BETA_SCHEDULE}"
+    --policy.beta_start="${BETA_START}"
+    --policy.beta_end="${BETA_END}"
+    --policy.prediction_type="${PREDICTION_TYPE}"
+    --policy.clip_sample="${CLIP_SAMPLE}"
+    --policy.clip_sample_range="${CLIP_SAMPLE_RANGE}"
+
+    # Inference (DDIM with fewer steps for speed)
+    --policy.num_inference_steps="${NUM_INFERENCE_STEPS}"
 
     # Training
     --steps="${STEPS}"
     --batch_size="${BATCH_SIZE}"
     --num_workers="${NUM_WORKERS}"
     --seed="${SEED}"
-    --use_policy_training_preset=false
+    --use_policy_training_preset=true
     --output_dir="${OUTPUT_DIR}"
 
     # Optimizer
-    --optimizer.type=adamw
+    --optimizer.type=adam
     --optimizer.lr="${LR}"
     --optimizer.weight_decay="${WEIGHT_DECAY}"
     --optimizer.grad_clip_norm="${GRAD_CLIP_NORM}"
-
-    # Scheduler
-    --scheduler.type=cosine_decay_with_warmup
-    --scheduler.num_warmup_steps="${WARMUP_STEPS}"
-    --scheduler.num_decay_steps="${STEPS}"
-    --scheduler.peak_lr="${LR}"
-    --scheduler.decay_lr="${DECAY_LR}"
 
     # Logging
     --save_freq="${SAVE_FREQ}"
@@ -189,7 +194,7 @@ CMD=(
     --eval_freq="${EVAL_FREQ}"
     --wandb.enable="${WANDB}"
 
-    # Disable push to hub by default (overridden below if requested)
+    # Disable push to hub by default
     --policy.push_to_hub=false
 )
 
