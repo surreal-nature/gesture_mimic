@@ -51,8 +51,9 @@ rsync -avz --progress \
 ## 2. Environment Setup
 
 ```bash
-conda create -n diffusion python=3.10 -y
-conda activate diffusion
+# Create a virtual environment
+python3 -m venv ~/diffusion-env
+source ~/diffusion-env/bin/activate
 
 # PyTorch for ROCm 7.2.2
 pip install torch==2.11 --index-url https://download.pytorch.org/whl/rocm7.2.2
