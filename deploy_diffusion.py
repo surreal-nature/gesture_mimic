@@ -49,6 +49,15 @@ def _set_device(device):
     DEVICE = device
 
 
+def opencv_gui_available():
+    try:
+        cv2.namedWindow("__gui_test__", cv2.WINDOW_NORMAL)
+        cv2.destroyWindow("__gui_test__")
+        return True
+    except cv2.error:
+        return False
+
+
 JOINT_NAMES = [
     "shoulder_pan",
     "shoulder_lift",
@@ -140,28 +149,21 @@ def frame_to_observation_yolo(frame, state, yolo_preprocessor, preprocessor):
     return preprocessor(batch), modified_rgb
 
 
-def connect_robot(port, baudrate=1000000):
+def connect_robot(port, robot_id="my_awesome_follower_arm", baudrate=1000000):
     try:
-        from lerobot.robots.so_follower import SOFollowerConfig, SOFollower
-        config = SOFollowerConfig(port=port, baudrate=baudrate)
-        robot = SOFollower(config)
-        robot.connect()
-        return robot
-    except ImportError:
-        from lerobot.common.robot_devices.motors.feetech import FeetechMotorsBus
-        motors = FeetechMotorsBus(
-            port=port,
-            motors={
-                "shoulder_pan": 1,
-                "shoulder_lift": 2,
-                "elbow_flex": 3,
-                "wrist_flex": 4,
-                "wrist_roll": 5,
-                "gripper": 6,
-            },
-        )
-        motors.connect()
-        return motors
+        import scservo_sdk  # noqa: F401 — required for SO-101 Feetech servos
+    except ImportError as e:
+        raise ImportError(
+            "SO-101 robot connection requires the Feetech SDK. "
+            "Install it with: pip install feetech-servo-sdk"
+        ) from e
+
+    from lerobot.robots.so_follower import SO101FollowerConfig, SO101Follower
+
+    config = SO101FollowerConfig(port=port, id=robot_id)
+    robot = SO101Follower(config)
+    robot.connect()
+    return robot
 
 
 def read_robot_state(robot):
@@ -233,7 +235,7 @@ def draw_overlay(frame, action, state, fps, step, denoise_ms, use_keypoints=Fals
 
 def run_webcam(policy, preprocessor, postprocessor, robot, camera_id, fps_target, device,
                use_keypoints=False, pose_estimator=None, yolo_preprocessor=None,
-               pose_backend="mediapipe", ensemble_k=0, ensemble_alpha=0.5):
+               pose_backend="mediapipe", ensemble_k=0, ensemble_alpha=0.5, no_display=False):
     cap = cv2.VideoCapture(camera_id)
     cap.set(cv2.CAP_PROP_FRAME_WIDTH, IMAGE_WIDTH)
     cap.set(cv2.CAP_PROP_FRAME_HEIGHT, IMAGE_HEIGHT)
@@ -257,9 +259,13 @@ def run_webcam(policy, preprocessor, postprocessor, robot, camera_id, fps_target
     ensembler = ActionEnsembler(k=ensemble_k, alpha=ensemble_alpha) if ensemble_k > 1 else None
     if ensembler:
         print(f"Temporal ensembling: k={ensemble_k}, alpha={ensemble_alpha}")
-    print("Press 'q' to quit, 'r' to reset policy state")
+    if no_display:
+        print("Running headless (no preview window). Press Ctrl+C to quit.")
+    else:
+        print("Press 'q' to quit, 'r' to reset policy state")
 
     policy.reset()
+    postprocessor.reset()
     if pose_estimator:
         pose_estimator.reset()
     if ensembler:
@@ -289,6 +295,7 @@ def run_webcam(policy, preprocessor, postprocessor, robot, camera_id, fps_target
             t_denoise_start = time.time()
             with torch.no_grad():
                 action = policy.select_action(batch)
+                action = postprocessor(action)
             denoise_ms = (time.time() - t_denoise_start) * 1000
 
             raw_action = action.squeeze(0).cpu().numpy()
@@ -311,28 +318,36 @@ def run_webcam(policy, preprocessor, postprocessor, robot, camera_id, fps_target
             elif use_keypoints and pose_estimator:
                 draw_skeleton(frame, pose_estimator)
 
-            display = draw_overlay(frame, current_action, robot_state, fps_actual, step,
-                                   denoise_ms, use_keypoints, pose_backend)
-            cv2.imshow("Gesture Mimic - Diffusion Policy", display)
+            sleep_time = frame_time - elapsed
             step += 1
 
-            sleep_time = frame_time - elapsed
-            wait_ms = max(1, int(sleep_time * 1000))
-            key = cv2.waitKey(wait_ms) & 0xFF
-            if key == ord("q"):
-                break
-            elif key == ord("r"):
-                policy.reset()
-                if pose_estimator:
-                    pose_estimator.reset()
-                if ensembler:
-                    ensembler.reset()
-                denoise_ms = 0.0
-                print(f"Policy reset at step {step}")
+            if no_display:
+                if step == 1 or step % 30 == 0:
+                    print(f"Step {step}, FPS {fps_actual:.1f}, denoise {denoise_ms:.0f}ms")
+                if sleep_time > 0:
+                    time.sleep(sleep_time)
+            else:
+                display = draw_overlay(frame, current_action, robot_state, fps_actual, step,
+                                       denoise_ms, use_keypoints, pose_backend)
+                cv2.imshow("Gesture Mimic - Diffusion Policy", display)
+                wait_ms = max(1, int(sleep_time * 1000))
+                key = cv2.waitKey(wait_ms) & 0xFF
+                if key == ord("q"):
+                    break
+                elif key == ord("r"):
+                    policy.reset()
+                    postprocessor.reset()
+                    if pose_estimator:
+                        pose_estimator.reset()
+                    if ensembler:
+                        ensembler.reset()
+                    denoise_ms = 0.0
+                    print(f"Policy reset at step {step}")
 
     finally:
         cap.release()
-        cv2.destroyAllWindows()
+        if not no_display:
+            cv2.destroyAllWindows()
         if robot:
             try:
                 robot.disconnect()
@@ -393,6 +408,7 @@ def run_video(policy, preprocessor, postprocessor, video_path, output_path, devi
         t_denoise = time.time()
         with torch.no_grad():
             action = policy.select_action(batch)
+            action = postprocessor(action)
         denoise_ms = (time.time() - t_denoise) * 1000
 
         raw_action = action.squeeze(0).cpu().numpy()
@@ -440,7 +456,14 @@ def main():
 
     parser.add_argument("--no-robot", action="store_true", help="Run without robot (webcam-only visualization)")
     parser.add_argument("--port", default="/dev/ttyUSB0", help="Robot serial port")
+    parser.add_argument(
+        "--robot-id",
+        default="my_awesome_follower_arm",
+        help="Robot ID matching calibration file (~/.cache/huggingface/lerobot/calibration/robots/so_follower/<id>.json)",
+    )
 
+    parser.add_argument("--no-display", action="store_true",
+                        help="Run without OpenCV preview window (robot still moves)")
     parser.add_argument("--camera-id", type=int, default=0, help="Webcam device ID")
     parser.add_argument("--video", type=str, default=None, help="Path to input video (instead of webcam)")
     parser.add_argument("--output", type=str, default=None, help="Path to save annotated output video")
@@ -506,16 +529,25 @@ def main():
     else:
         robot = None
         if not args.no_robot:
-            print(f"Connecting to robot on {args.port}...")
-            robot = connect_robot(args.port)
+            print(f"Connecting to robot on {args.port} (id={args.robot_id})...")
+            robot = connect_robot(args.port, robot_id=args.robot_id)
             print("Robot connected.")
         else:
             print("Running in no-robot mode (visualization only)")
 
+        no_display = args.no_display
+        if not no_display and not opencv_gui_available():
+            print(
+                "OpenCV GUI unavailable (likely opencv-python-headless). "
+                "Running headless; use Ctrl+C to quit.\n"
+                "To restore preview: pip uninstall opencv-python-headless && pip install opencv-python"
+            )
+            no_display = True
+
         run_webcam(policy, preprocessor, postprocessor, robot, args.camera_id, args.fps, args.device,
                    use_keypoints=args.use_keypoints, pose_estimator=pose_estimator,
                    yolo_preprocessor=yolo_preprocessor, pose_backend=args.pose_backend,
-                   ensemble_k=ens_k, ensemble_alpha=ens_alpha)
+                   ensemble_k=ens_k, ensemble_alpha=ens_alpha, no_display=no_display)
 
     if pose_estimator:
         pose_estimator.close()

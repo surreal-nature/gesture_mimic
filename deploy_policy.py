@@ -109,29 +109,22 @@ def frame_to_observation_yolo(frame, state, yolo_preprocessor, preprocessor):
     return preprocessor(batch), modified_rgb
 
 
-def connect_robot(port, baudrate=1000000):
+def connect_robot(port, robot_id="my_awesome_follower_arm", baudrate=1000000):
     """Connect to a real SO-101 follower arm via Feetech serial."""
     try:
-        from lerobot.robots.so_follower import SOFollowerConfig, SOFollower
-        config = SOFollowerConfig(port=port, baudrate=baudrate)
-        robot = SOFollower(config)
-        robot.connect()
-        return robot
-    except ImportError:
-        from lerobot.common.robot_devices.motors.feetech import FeetechMotorsBus
-        motors = FeetechMotorsBus(
-            port=port,
-            motors={
-                "shoulder_pan": 1,
-                "shoulder_lift": 2,
-                "elbow_flex": 3,
-                "wrist_flex": 4,
-                "wrist_roll": 5,
-                "gripper": 6,
-            },
-        )
-        motors.connect()
-        return motors
+        import scservo_sdk  # noqa: F401 — required for SO-101 Feetech servos
+    except ImportError as e:
+        raise ImportError(
+            "SO-101 robot connection requires the Feetech SDK. "
+            "Install it with: pip install feetech-servo-sdk"
+        ) from e
+
+    from lerobot.robots.so_follower import SO101FollowerConfig, SO101Follower
+
+    config = SO101FollowerConfig(port=port, id=robot_id)
+    robot = SO101Follower(config)
+    robot.connect()
+    return robot
 
 
 def read_robot_state(robot):
@@ -223,11 +216,10 @@ def run_webcam(policy, preprocessor, postprocessor, robot, camera_id, fps_target
     print("Press 'q' to quit, 'r' to reset policy state")
 
     policy.reset()
+    postprocessor.reset()
     if pose_estimator:
         pose_estimator.reset()
     robot_state = read_robot_state(robot) if robot else np.zeros(6, dtype=np.float32)
-    action_chunk = None
-    chunk_idx = 0
     step = 0
     frame_time = 1.0 / fps_target
 
@@ -240,21 +232,17 @@ def run_webcam(policy, preprocessor, postprocessor, robot, camera_id, fps_target
                 break
 
             yolo_display_rgb = None
-            if action_chunk is None or chunk_idx >= len(action_chunk):
-                if use_keypoints and yolo_preprocessor:
-                    batch, yolo_display_rgb = frame_to_observation_yolo(
-                        frame, robot_state, yolo_preprocessor, preprocessor)
-                elif use_keypoints and pose_estimator:
-                    batch = frame_to_observation_keypoints(frame, robot_state, pose_estimator, preprocessor)
-                else:
-                    batch = frame_to_observation_rgb(frame, robot_state, preprocessor)
-                with torch.no_grad():
-                    action = policy.select_action(batch)
-                action_chunk = action.squeeze(0).cpu().numpy()
-                chunk_idx = 0
-
-            current_action = action_chunk[chunk_idx]
-            chunk_idx += 1
+            if use_keypoints and yolo_preprocessor:
+                batch, yolo_display_rgb = frame_to_observation_yolo(
+                    frame, robot_state, yolo_preprocessor, preprocessor)
+            elif use_keypoints and pose_estimator:
+                batch = frame_to_observation_keypoints(frame, robot_state, pose_estimator, preprocessor)
+            else:
+                batch = frame_to_observation_rgb(frame, robot_state, preprocessor)
+            with torch.no_grad():
+                action = policy.select_action(batch)
+                action = postprocessor(action)
+            current_action = action.squeeze(0).cpu().numpy()
 
             if robot:
                 send_robot_action(robot, current_action)
@@ -280,9 +268,9 @@ def run_webcam(policy, preprocessor, postprocessor, robot, camera_id, fps_target
                 break
             elif key == ord("r"):
                 policy.reset()
+                postprocessor.reset()
                 if pose_estimator:
                     pose_estimator.reset()
-                action_chunk = None
                 print(f"Policy reset at step {step}")
 
     finally:
@@ -325,8 +313,6 @@ def run_video(policy, preprocessor, postprocessor, video_path, output_path, devi
     if pose_estimator:
         pose_estimator.reset()
     robot_state = np.zeros(6, dtype=np.float32)
-    action_chunk = None
-    chunk_idx = 0
     all_actions = []
 
     step = 0
@@ -336,21 +322,17 @@ def run_video(policy, preprocessor, postprocessor, video_path, output_path, devi
             break
 
         yolo_display_rgb = None
-        if action_chunk is None or chunk_idx >= len(action_chunk):
-            if use_keypoints and yolo_preprocessor:
-                batch, yolo_display_rgb = frame_to_observation_yolo(
-                    frame, robot_state, yolo_preprocessor, preprocessor)
-            elif use_keypoints and pose_estimator:
-                batch = frame_to_observation_keypoints(frame, robot_state, pose_estimator, preprocessor)
-            else:
-                batch = frame_to_observation_rgb(frame, robot_state, preprocessor)
-            with torch.no_grad():
-                action = policy.select_action(batch)
-            action_chunk = action.squeeze(0).cpu().numpy()
-            chunk_idx = 0
-
-        current_action = action_chunk[chunk_idx]
-        chunk_idx += 1
+        if use_keypoints and yolo_preprocessor:
+            batch, yolo_display_rgb = frame_to_observation_yolo(
+                frame, robot_state, yolo_preprocessor, preprocessor)
+        elif use_keypoints and pose_estimator:
+            batch = frame_to_observation_keypoints(frame, robot_state, pose_estimator, preprocessor)
+        else:
+            batch = frame_to_observation_rgb(frame, robot_state, preprocessor)
+        with torch.no_grad():
+            action = policy.select_action(batch)
+            action = postprocessor(action)
+        current_action = action.squeeze(0).cpu().numpy()
         all_actions.append(current_action.copy())
 
         if yolo_display_rgb is not None:
@@ -391,6 +373,11 @@ def main():
     # Robot config
     parser.add_argument("--no-robot", action="store_true", help="Run without robot (webcam-only visualization)")
     parser.add_argument("--port", default="/dev/ttyUSB0", help="Robot serial port")
+    parser.add_argument(
+        "--robot-id",
+        default="my_awesome_follower_arm",
+        help="Robot ID matching calibration file (~/.cache/huggingface/lerobot/calibration/robots/so_follower/<id>.json)",
+    )
 
     # Input source
     parser.add_argument("--camera-id", type=int, default=0, help="Webcam device ID")
@@ -446,8 +433,8 @@ def main():
     else:
         robot = None
         if not args.no_robot:
-            print(f"Connecting to robot on {args.port}...")
-            robot = connect_robot(args.port)
+            print(f"Connecting to robot on {args.port} (id={args.robot_id})...")
+            robot = connect_robot(args.port, robot_id=args.robot_id)
             print("Robot connected.")
         else:
             print("Running in no-robot mode (visualization only)")

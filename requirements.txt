@@ -8,8 +8,13 @@ torch>=2.0
 # Or install from PyPI:
 lerobot>=0.5.0
 
-# Deployment (webcam capture and visualization)
+# SO-101 robot deployment (Feetech serial servos)
+feetech-servo-sdk>=1.0.0
+
+# Deployment (webcam capture and visualization; must NOT use opencv-python-headless)
 opencv-python>=4.8
+# If preview fails with "cv2.imshow ... not implemented", run:
+#   pip uninstall opencv-python-headless && pip install opencv-python
 
 # Pose estimation (keypoint mode)
 mediapipe>=0.10
