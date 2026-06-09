@@ -8,7 +8,7 @@ Deploy the trained Diffusion Policy (YOLO keypoint backend) for real-time gestur
 |-----------|-----------------|
 | OS | Ubuntu 22.04 |
 | GPU Stack | ROCm 7.2.2 |
-| PyTorch | 2.11+rocm7.2.2 |
+| PyTorch | 2.9.1+rocm7.2 |
 | LeRobot | 0.5.2 |
 | Robot | SO-101 (Feetech servos, 6 joints) |
 | Robot Port | `/dev/ttyACM0` |
@@ -55,8 +55,8 @@ rsync -avz --progress \
 python3 -m venv ~/diffusion-env
 source ~/diffusion-env/bin/activate
 
-# PyTorch for ROCm 7.2.2
-pip install torch==2.11 --index-url https://download.pytorch.org/whl/rocm7.2.2
+# PyTorch for ROCm 7.2
+pip3 install torch==2.9.1 torchvision==0.24.0 torchaudio==2.9.0 --index-url https://download.pytorch.org/whl/rocm7.2
 
 # LeRobot
 pip install lerobot==0.5.2
